@@ -101,11 +101,97 @@ def fuzzy_map(name, choices, cutoff=0.8):
     matches = get_close_matches(name, choices, n=1, cutoff=cutoff)
     return matches[0] if matches else None
 
+def map_promoter_names_to_codes(df_to_map: pd.DataFrame, promoter_name_column: str, df_control: pd.DataFrame) -> pd.DataFrame:
+    """
+    Maps promoter names in a DataFrame to promoter codes ("N") using various strategies.
+
+    Args:
+        df_to_map: The DataFrame that needs promoter names mapped to codes.
+        promoter_name_column: The name of the column in df_to_map containing promoter names.
+        df_control: Control DataFrame with "N", "Nombre", "Nombre_upper", and "Nombre_norm".
+
+    Returns:
+        The df_to_map with an added "N" column containing mapped promoter codes.
+    """
+    if df_control.empty or not all(col in df_control.columns for col in ["N", "Nombre", "Nombre_upper", "Nombre_norm"]):
+        st.warning("df_control está vacío o le faltan columnas esenciales ('N', 'Nombre', 'Nombre_upper', 'Nombre_norm'). No se puede mapear nombres.")
+        df_to_map["N"] = pd.NA
+        return df_to_map
+
+    if promoter_name_column not in df_to_map.columns:
+        st.warning(f"La columna '{promoter_name_column}' no existe en el DataFrame a mapear. No se puede mapear nombres.")
+        df_to_map["N"] = pd.NA
+        return df_to_map
+
+    # Initialize "N" column
+    df_to_map["N"] = pd.NA
+
+    # --- a. Initial Cleaning (applied on a temporary column for mapping) ---
+    temp_promoter_name_col = "_temp_promoter_name_upper"
+    df_to_map[temp_promoter_name_col] = df_to_map[promoter_name_column].astype(str).str.strip().str.upper()
+
+    # --- b. Direct Mapping (using Nombre_upper) ---
+    map_upper_to_N = dict(zip(df_control["Nombre_upper"], df_control["N"]))
+    df_to_map["N"] = df_to_map[temp_promoter_name_col].map(map_upper_to_N)
+
+    # --- c. Normalized Name Mapping (for remaining unmapped names) ---
+    unmapped_indices = df_to_map["N"].isna()
+    if unmapped_indices.any():
+        # Normalize names in df_to_map for those still unmapped
+        temp_normalized_name_col = "_temp_normalized_name"
+        df_to_map.loc[unmapped_indices, temp_normalized_name_col] = df_to_map.loc[unmapped_indices, temp_promoter_name_col].apply(normalize_name)
+        
+        # Map using df_control's pre-normalized "Nombre_norm"
+        map_norm_to_N = dict(zip(df_control["Nombre_norm"], df_control["N"]))
+        df_to_map.loc[unmapped_indices, "N"] = df_to_map.loc[unmapped_indices, temp_normalized_name_col].map(map_norm_to_N)
+
+    # --- d. Fuzzy Mapping (for remaining unmapped names) ---
+    unmapped_indices = df_to_map["N"].isna() # Re-check unmapped indices
+    if unmapped_indices.any():
+        # Ensure normalized names exist for all current unmapped rows if not created in step c for all
+        if temp_normalized_name_col not in df_to_map.columns: # Should have been created
+             df_to_map[temp_normalized_name_col] = df_to_map[temp_promoter_name_col].apply(normalize_name)
+        elif df_to_map.loc[unmapped_indices, temp_normalized_name_col].isnull().any(): # If some were not populated
+            df_to_map.loc[unmapped_indices & df_to_map[temp_normalized_name_col].isnull(), temp_normalized_name_col] = \
+                df_to_map.loc[unmapped_indices & df_to_map[temp_normalized_name_col].isnull(), temp_promoter_name_col].apply(normalize_name)
+
+
+        choices_fuzzy = df_control["Nombre_norm"].unique().tolist()
+        
+        # Apply fuzzy_map to the temporary normalized column for unmapped rows
+        df_to_map.loc[unmapped_indices, "_temp_fuzzy_match"] = df_to_map.loc[unmapped_indices, temp_normalized_name_col].apply(
+            lambda name_to_match: fuzzy_map(name_to_match, choices_fuzzy, cutoff=0.8) # Standard cutoff
+        )
+        
+        # Map fuzzy matches back to N using the Nombre_norm -> N map
+        map_norm_to_N_for_fuzzy = dict(zip(df_control["Nombre_norm"], df_control["N"])) # Re-ensure map
+        df_to_map.loc[unmapped_indices, "N"] = df_to_map.loc[unmapped_indices, "_temp_fuzzy_match"].map(map_norm_to_N_for_fuzzy)
+
+
+    # Clean up temporary columns
+    temp_cols_to_drop = [temp_promoter_name_col, "_temp_normalized_name", "_temp_fuzzy_match"]
+    for col in temp_cols_to_drop:
+        if col in df_to_map.columns:
+            df_to_map.drop(columns=[col], inplace=True)
+            
+    unmapped_count = df_to_map["N"].isna().sum()
+    if unmapped_count > 0:
+        st.warning(f"{unmapped_count} nombres de promotor(es) en la columna '{promoter_name_column}' no pudieron ser mapeados a un código 'N'.")
+
+    return df_to_map
+
 # --------------------------------------------------------------------
 #                       CARGA DE DATOS (CACHED)
 # --------------------------------------------------------------------
 @st.cache_data
 def load_data_control(vas_file):
+    if not vas_file:
+        df_control_empty = pd.DataFrame(columns=["N", "Nombre", "Antigüedad (meses)", "Nombre_upper", "Nombre_norm"])
+        promotores_dict_empty = {}
+        # Based on current logic, df_metas_summary is built from df_metas with ["Promotor", "Semana", "Meta"]
+        df_metas_summary_empty = pd.DataFrame(columns=["Promotor", "Semana", "Meta"])
+        return df_control_empty, promotores_dict_empty, df_metas_summary_empty
+
     df_control = pd.read_excel(vas_file, sheet_name="Control")
     required_cols_control = ["N", "Nombre", "Antigüedad (meses)"]
     check_required_columns(df_control, required_cols_control, "df_control (sheet Control)")
@@ -117,6 +203,7 @@ def load_data_control(vas_file):
     )
     # <-- CAMBIO: creamos "Nombre_upper" en df_control para facilitar mapeos
     df_control["Nombre_upper"] = df_control["Nombre"].str.strip().str.upper()
+    df_control["Nombre_norm"] = df_control["Nombre"].apply(normalize_name) # Ensure Nombre_norm is created
 
     promotores_dict = dict(zip(df_control["N"], df_control["Nombre"]))
 
@@ -146,6 +233,12 @@ def load_data_control(vas_file):
 
 @st.cache_data
 def load_data_cobranza(cob_file):
+    if not cob_file:
+        return pd.DataFrame(columns=[
+            "Nombre Promotor", "Fecha Transacción", "Depósito", "Estado", 
+            "Municipio", "Contrato", "Semana", "Día_num", "N"
+        ])
+
     df_cobranza = pd.read_excel(
         cob_file,
         sheet_name="Recuperaciones",
@@ -167,11 +260,26 @@ def load_data_cobranza(cob_file):
 
 @st.cache_data
 def load_data_colocaciones(col_file):
+    """
+    Carga y procesa los datos de colocaciones desde un archivo Excel.
+
+    Args:
+        col_file: Objeto de archivo cargado para el archivo de colocaciones.
+
+    Returns:
+        tuple: Dos DataFrames:
+            - df_col_agg: DataFrame agregado con ["Nombre promotor", "Semana", "Creditos_Colocados", "Venta"].
+            - df_col_detail_return: DataFrame detallado con las columnas de `cols_to_read_from_excel`.
+            Ambos son DataFrames vacíos con la estructura definida si hay errores o no hay archivo.
+    """
     cols_to_read_from_excel = [
         "Nombre promotor", "Fecha desembolso", "Monto desembolsado",
         "Nombre del cliente", "Contrato", "Cuota total", "Fecha primer pago"
     ]
+    
+    # Definir estructuras de DataFrames vacíos para retorno consistente
     empty_agg = pd.DataFrame(columns=["Nombre promotor", "Semana", "Creditos_Colocados", "Venta"])
+    # Asegurar que el orden de columnas en empty_detail sea el mismo que cols_to_read_from_excel
     empty_detail = pd.DataFrame(columns=cols_to_read_from_excel)
 
     if not col_file:
@@ -184,116 +292,86 @@ def load_data_colocaciones(col_file):
             skiprows=4,
             header=0
         )
-        # DEBUG para ver las columnas leídas directamente del Excel:
-        st.info(f"DEBUG load_data_colocaciones: Columnas en df_col_raw leídas del Excel son: {df_col_raw.columns.tolist()}")
+    except FileNotFoundError:
+        st.error("Error: Archivo de Colocaciones no encontrado. Por favor, verifica la ruta o el archivo.")
+        return empty_agg, empty_detail
+    except ValueError as e: # Específicamente para hoja no encontrada
+        if "Colocación" in str(e):
+            st.error("Error CRÍTICO: La hoja 'Colocación' no se encontró en el archivo de Colocaciones.")
+            st.info("Por favor, asegúrate de que tu archivo Excel contenga una hoja llamada exactamente 'Colocación'.")
+        else:
+            st.error(f"Error al leer el archivo de Colocaciones: {e}")
+        return empty_agg, empty_detail
     except Exception as e:
         st.error(f"Error CRÍTICO al leer el archivo de Colocaciones (hoja 'Colocación'): {e}")
         return empty_agg, empty_detail
 
+    # Verificar columnas requeridas
     missing_cols = [col for col in cols_to_read_from_excel if col not in df_col_raw.columns]
     if missing_cols:
-        st.error(f"Faltan las siguientes columnas requeridas en la hoja 'Colocación' del archivo de Colocaciones: {', '.join(missing_cols)}")
-        st.warning(f"Columnas encontradas en tu archivo Excel 'Colocaciones.xlsx': {', '.join(df_col_raw.columns.tolist())}")
+        st.error(f"Faltan las siguientes columnas requeridas en la hoja 'Colocación': {', '.join(missing_cols)}")
+        st.warning(f"Columnas encontradas en tu archivo Excel: {', '.join(df_col_raw.columns.tolist())}")
         st.info("Por favor, asegúrate de que los nombres de las columnas en tu archivo Excel (fila 5) coincidan exactamente con los esperados.")
-        return empty_agg, df_col_raw
+        return empty_agg, empty_detail # Devolver empty_detail en lugar de df_col_raw
 
+    # Crear df_col_detail_return con las columnas especificadas y en el orden correcto
     df_col_detail_return = df_col_raw[cols_to_read_from_excel].copy()
 
+    # Limpieza y transformación de datos para df_col_detail_return
     if "Nombre promotor" in df_col_detail_return.columns:
         df_col_detail_return["Nombre promotor"] = df_col_detail_return["Nombre promotor"].astype(str).str.strip().str.upper()
+    
+    if "Fecha desembolso" in df_col_detail_return.columns:
+        df_col_detail_return["Fecha desembolso"] = pd.to_datetime(df_col_detail_return["Fecha desembolso"], errors='coerce')
+    
     if "Fecha primer pago" in df_col_detail_return.columns:
         df_col_detail_return["Fecha primer pago"] = pd.to_datetime(df_col_detail_return["Fecha primer pago"], errors='coerce')
+    
+    if "Monto desembolsado" in df_col_detail_return.columns:
+        df_col_detail_return["Monto desembolsado"] = df_col_detail_return["Monto desembolsado"].astype(str).str.replace(',', '', regex=False)
+        df_col_detail_return["Monto desembolsado"] = pd.to_numeric(df_col_detail_return["Monto desembolsado"], errors='coerce').fillna(0)
+
     if "Cuota total" in df_col_detail_return.columns:
         df_col_detail_return["Cuota total"] = df_col_detail_return["Cuota total"].astype(str).str.replace(',', '', regex=False)
         df_col_detail_return["Cuota total"] = pd.to_numeric(df_col_detail_return["Cuota total"], errors='coerce').fillna(0)
-    if "Fecha desembolso" in df_col_detail_return.columns:
-        df_col_detail_return["Fecha desembolso"] = pd.to_datetime(df_col_detail_return["Fecha desembolso"], errors='coerce')
-    if "Monto desembolsado" in df_col_detail_return.columns:
-        df_col_detail_return["Monto desembolsado"] = pd.to_numeric(df_col_detail_return["Monto desembolsado"].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0)
 
+    # Preparación para la agregación de df_col_agg
     required_for_agg = ["Nombre promotor", "Fecha desembolso", "Monto desembolsado"]
+    
+    # Verificar si las columnas necesarias para la agregación están presentes y no son todas NaN
+    # Usamos df_col_detail_return como base ya que está limpio
+    if all(col in df_col_detail_return.columns for col in required_for_agg) and \
+       not df_col_detail_return[required_for_agg].isnull().all().all(): # Verifica que no todas las celdas en las cols de agg sean NaN
 
-    # Crear una copia para la agregación solo si las columnas necesarias están presentes
-    # Esto previene errores si df_col_raw no tiene todas las columnas de required_for_agg
-    # (aunque el chequeo de missing_cols ya debería haberlo cubierto para "Nombre promotor")
+        # Realizar una copia para la agregación para no afectar df_col_detail_return innecesariamente
+        df_for_agg = df_col_detail_return[required_for_agg].copy()
 
-    # Verificar que todas las columnas de required_for_agg estén en df_col_raw
-    if all(col in df_col_raw.columns for col in required_for_agg):
-        df_col_for_aggregation = df_col_raw[required_for_agg].copy()
-        df_col_for_aggregation["Fecha desembolso"] = pd.to_datetime(df_col_for_aggregation["Fecha desembolso"], errors='coerce')
-        df_col_for_aggregation["Monto desembolsado"] = pd.to_numeric(df_col_for_aggregation["Monto desembolsado"].astype(str).str.replace(',', '', regex=False), errors='coerce')
+        # Eliminar filas donde CUALQUIERA de las columnas clave para la agregación sea NaN
+        # Esto es importante para asegurar que "count" y "sum" funcionen correctamente.
+        df_for_agg.dropna(subset=required_for_agg, inplace=True)
 
-        cols_for_dropna_agg = [col for col in required_for_agg if col in df_col_for_aggregation.columns]
-        if len(cols_for_dropna_agg) == len(required_for_agg):
-             df_col_for_aggregation.dropna(subset=cols_for_dropna_agg, inplace=True)
+        if not df_for_agg.empty:
+            # "Nombre promotor" ya está limpio en df_col_detail_return
+            # "Fecha desembolso" ya está como datetime
+            # "Monto desembolsado" ya está como numérico y con NaNs en 0 (aunque dropna los quita)
 
-        if not df_col_for_aggregation.empty and "Nombre promotor" in df_col_for_aggregation.columns and "Fecha desembolso" in df_col_for_aggregation.columns:
-            df_col_for_aggregation["Nombre promotor"] = df_col_for_aggregation["Nombre promotor"].astype(str).str.strip().str.upper()
-            df_col_for_aggregation["Semana"] = df_col_for_aggregation["Fecha desembolso"].dt.to_period("W-FRI")
-            df_col_agg = df_col_for_aggregation.groupby(["Nombre promotor", "Semana"], as_index=False).agg(
+            df_for_agg["Semana"] = df_for_agg["Fecha desembolso"].dt.to_period("W-FRI")
+            
+            df_col_agg = df_for_agg.groupby(["Nombre promotor", "Semana"], as_index=False).agg(
                 Creditos_Colocados=("Monto desembolsado", "count"),
                 Venta=("Monto desembolsado", "sum")
             )
         else:
-            df_col_agg = empty_agg.copy() # Usar .copy() para evitar modificar el original
+            # Si df_for_agg queda vacío después de dropna, retornar empty_agg
+            df_col_agg = empty_agg.copy()
     else:
-        st.error(f"Faltan columnas esenciales para la agregación en Colocaciones: {[col for col in required_for_agg if col not in df_col_raw.columns]}")
+        # Si faltan columnas clave o todas son NaN, no se puede agregar.
+        # No es necesario un st.error aquí si ya se notificó la falta de columnas principales.
+        # Si las columnas están pero son todos NaN, es un problema de datos, no de estructura.
         df_col_agg = empty_agg.copy()
+        if not all(col in df_col_detail_return.columns for col in required_for_agg):
+             st.warning(f"Advertencia: Faltan columnas esenciales para la agregación en Colocaciones: {[col for col in required_for_agg if col not in df_col_detail_return.columns]}. El resumen agregado de colocaciones puede estar incompleto o vacío.")
 
-    return df_col_agg, df_col_detail_return
-
-    # Verificar que las columnas esenciales estén presentes después de la carga
-    missing_cols = [col for col in cols_to_read_from_excel if col not in df_col_raw.columns]
-    if missing_cols:
-        st.error(f"Faltan las siguientes columnas requeridas en la hoja 'Colocación' del archivo de Colocaciones: {', '.join(missing_cols)}")
-        st.warning(f"Columnas encontradas en tu archivo: {', '.join(df_col_raw.columns.tolist())}")
-        st.info("Por favor, asegúrate de que los nombres de las columnas en tu archivo Excel (fila 5) coincidan exactamente con los esperados.")
-        # Retornamos el df_col_raw para posible inspección si hay error, y un agg vacío.
-        return empty_agg, df_col_raw
-
-    # --- Prepara df_col_detail_return (para la pestaña "Créditos a Detalle") ---
-    df_col_detail_return = df_col_raw[cols_to_read_from_excel].copy() # Seleccionamos solo las que necesitamos
-
-    # Limpieza y conversión de tipos para df_col_detail_return
-    if "Nombre promotor" in df_col_detail_return.columns:
-        df_col_detail_return["Nombre promotor"] = df_col_detail_return["Nombre promotor"].astype(str).str.strip().str.upper()
-    if "Fecha primer pago" in df_col_detail_return.columns:
-        df_col_detail_return["Fecha primer pago"] = pd.to_datetime(df_col_detail_return["Fecha primer pago"], errors='coerce')
-    if "Cuota total" in df_col_detail_return.columns:
-        # Intentamos convertir la "Cuota total" a número, manejando posibles comas como separadores de miles.
-        df_col_detail_return["Cuota total"] = df_col_detail_return["Cuota total"].astype(str).str.replace(',', '', regex=False)
-        df_col_detail_return["Cuota total"] = pd.to_numeric(df_col_detail_return["Cuota total"], errors='coerce').fillna(0)
-    if "Fecha desembolso" in df_col_detail_return.columns: # Necesaria para el detalle también si se usa
-         df_col_detail_return["Fecha desembolso"] = pd.to_datetime(df_col_detail_return["Fecha desembolso"], errors='coerce')
-    if "Monto desembolsado" in df_col_detail_return.columns: # Necesaria para el detalle también si se usa
-         df_col_detail_return["Monto desembolsado"] = pd.to_numeric(df_col_detail_return["Monto desembolsado"].astype(str).str.replace(',', '', regex=False), errors='coerce').fillna(0)
-
-
-    # --- Prepara df_col_for_aggregation (para la lógica de agregación existente) ---
-    # Usaremos df_col_raw que tiene todas las columnas leídas del Excel.
-    # Columnas requeridas específicamente para la agregación:
-    required_for_agg = ["Nombre promotor", "Fecha desembolso", "Monto desembolsado"]
-    missing_for_agg = [col for col in required_for_agg if col not in df_col_raw.columns]
-
-    if missing_for_agg:
-        st.error(f"Faltan columnas para la agregación de colocaciones (necesarias para otros cálculos): {', '.join(missing_for_agg)}")
-        df_col_agg = empty_agg # df_col_agg vacío si faltan columnas esenciales para la agregación
-    else:
-        # Hacemos una copia para no modificar df_col_raw directamente para la agregación
-        df_col_for_aggregation = df_col_raw[required_for_agg].copy()
-
-        df_col_for_aggregation["Fecha desembolso"] = pd.to_datetime(df_col_for_aggregation["Fecha desembolso"], errors='coerce')
-        df_col_for_aggregation["Monto desembolsado"] = df_col_for_aggregation["Monto desembolsado"].astype(str).str.replace(',', '', regex=False)
-        df_col_for_aggregation["Monto desembolsado"] = pd.to_numeric(df_col_for_aggregation["Monto desembolsado"], errors='coerce')
-
-        df_col_for_aggregation.dropna(subset=["Nombre promotor", "Fecha desembolso", "Monto desembolsado"], inplace=True) # Quitar filas donde estos sean nulos
-        df_col_for_aggregation["Nombre promotor"] = df_col_for_aggregation["Nombre promotor"].astype(str).str.strip().str.upper()
-        df_col_for_aggregation["Semana"] = df_col_for_aggregation["Fecha desembolso"].dt.to_period("W-FRI")
-
-        df_col_agg = df_col_for_aggregation.groupby(["Nombre promotor", "Semana"], as_index=False).agg(
-            Creditos_Colocados=("Monto desembolsado", "count"),
-            Venta=("Monto desembolsado", "sum")
-        )
 
     return df_col_agg, df_col_detail_return
 
@@ -334,38 +412,13 @@ def load_data_descuentos(por_capturar_file, df_control):
         # Si no quedan filas después del filtro > 0 (o si estaba vacío antes)
         return pd.DataFrame(columns=["N", "Semana", "Descuento_Renovacion"])
 
-    # Mapeo de "Promotor" a "N" (CodigoPromotor)
-    if df_control.empty or "Nombre_upper" not in df_control.columns or "N" not in df_control.columns:
-        st.error("No se pueden mapear promotores para descuentos: df_control está vacío o faltan columnas 'Nombre_upper'/'N'.")
-        df_desc["CodigoPromotor"] = pd.NA 
-    else:
-        name_to_code = dict(zip(df_control["Nombre_upper"], df_control["N"]))
-        df_desc["CodigoPromotor"] = df_desc["Promotor"].map(name_to_code)
-        
-        unmapped_direct_count = df_desc["CodigoPromotor"].isna().sum()
-        if unmapped_direct_count > 0:
-            # Intento de Fuzzy Map para los no mapeados directamente
-            if "Nombre" in df_control.columns: # Asegurar que 'Nombre' existe para normalize_name
-                control_norm_to_N_map = dict(zip(df_control["Nombre"].apply(normalize_name), df_control["N"]))
-                unmapped_indices = df_desc["CodigoPromotor"].isna()
-                
-                df_desc.loc[unmapped_indices, "Promotor_Normalized_Temp"] = df_desc.loc[unmapped_indices, "Promotor"].apply(normalize_name)
-                choices_fuzzy = list(control_norm_to_N_map.keys())
-                
-                df_desc.loc[unmapped_indices, "Promotor_Fuzzy_Match"] = df_desc.loc[unmapped_indices, "Promotor_Normalized_Temp"].apply(
-                    lambda nm: fuzzy_map(nm, choices_fuzzy)
-                )
-                df_desc.loc[unmapped_indices, "CodigoPromotor"] = df_desc.loc[unmapped_indices, "Promotor_Fuzzy_Match"].map(control_norm_to_N_map)
+    # Mapeo de "Promotor" a "N" (CodigoPromotor) utilizando la nueva función centralizada
+    df_desc = map_promoter_names_to_codes(df_desc, "Promotor", df_control)
+    # La columna "N" ya está en df_desc, no se necesita "CodigoPromotor"
 
-                # Limpiar columnas temporales
-                if "Promotor_Normalized_Temp" in df_desc.columns: df_desc.drop(columns=["Promotor_Normalized_Temp"], inplace=True)
-                if "Promotor_Fuzzy_Match" in df_desc.columns: df_desc.drop(columns=["Promotor_Fuzzy_Match"], inplace=True)
-            else:
-                st.warning("No se pudo intentar fuzzy map para descuentos porque la columna 'Nombre' no está en df_control.")
-
-    # Continuar con el resto de la lógica solo si hay filas con CodigoPromotor
-    if df_desc["CodigoPromotor"].notna().any():
-        df_desc_con_N = df_desc.dropna(subset=["CodigoPromotor"]).copy()
+    # Continuar con el resto de la lógica solo si hay filas con "N"
+    if df_desc["N"].notna().any():
+        df_desc_con_N = df_desc.dropna(subset=["N"]).copy() # Usar "N"
         
         df_desc_con_N["Fecha Ministración"] = pd.to_datetime(df_desc_con_N["Fecha Ministración"], errors="coerce")
         df_desc_con_N.dropna(subset=["Fecha Ministración"], inplace=True) 
@@ -373,10 +426,11 @@ def load_data_descuentos(por_capturar_file, df_control):
         if not df_desc_con_N.empty:
             df_desc_con_N["Semana"] = df_desc_con_N["Fecha Ministración"].dt.to_period("W-FRI")
             
-            df_desc_agg = df_desc_con_N.groupby(["CodigoPromotor", "Semana"], as_index=False)["Descuento_Num_Temp"].sum()
+            # Agrupar por "N" directamente
+            df_desc_agg = df_desc_con_N.groupby(["N", "Semana"], as_index=False)["Descuento_Num_Temp"].sum()
             
             df_desc_agg.rename(columns={
-                "CodigoPromotor": "N",
+                # "N" ya es el nombre correcto
                 "Descuento_Num_Temp": "Descuento_Renovacion"
             }, inplace=True)
         else:
@@ -395,7 +449,9 @@ def load_data_pagos(pagos_file):
     Devuelve un DataFrame con columnas ['PROMOTOR','SALDO'].
     """
     if not pagos_file:
-        return pd.DataFrame(columns=["PROMOTOR","SALDO"])
+        # Return structure that would be expected before mapping to "N"
+        return pd.DataFrame(columns=["PROMOTOR", "SALDO", "PS", "SV", "VENCI"]) 
+
     df_pagos = pd.read_excel(
         pagos_file,
         skiprows=3,                  # saltamos las primeras 3 filas
@@ -508,144 +564,63 @@ def main():
         try:
             df_control, promotores_dict, df_metas_summary = load_data_control(vas_file)
             df_cobranza = load_data_cobranza(cob_file)
-            # -------------------------------------------------------------
-            # NORMALIZAMOS NOMBRES en df_cobranza y los convertimos a código
-            # -------------------------------------------------------------
-            df_cobranza["Nombre_norm"] = df_cobranza["Nombre Promotor"].apply(normalize_name)
-
-            # Diccionario NOMBRE_NORMALIZADO  ->  CÓDIGO  (P1, P2…)
-            name_to_code = dict(zip(df_control["Nombre"].apply(normalize_name), df_control["N"]))
-
-            # Asignamos código
-            df_cobranza["N"] = df_cobranza["Nombre_norm"].map(name_to_code)
-
-            # Fallback fuzzy: intentamos empatar lo que quedó sin código
-            unmapped = df_cobranza["N"].isna()
-            choices  = list(name_to_code.keys())
-            df_cobranza.loc[unmapped, "Nombre_norm"] = df_cobranza.loc[unmapped, "Nombre_norm"].apply(
-                lambda nm: fuzzy_map(nm, choices)
-            )
-            df_cobranza["N"] = df_cobranza["Nombre_norm"].map(name_to_code)
-
-# (Esto está dentro del bloque 'try:' principal de la función main, 
-# después de procesar df_cobranza)
+            
+            # Mapeo de nombres para df_cobranza
+            if df_cobranza is not None and not df_cobranza.empty and "Nombre Promotor" in df_cobranza.columns:
+                df_cobranza = map_promoter_names_to_codes(df_cobranza.copy(), "Nombre Promotor", df_control)
+            elif df_cobranza is not None and "N" not in df_cobranza.columns: # Ensure N column if mapping did not run
+                df_cobranza["N"] = pd.NA
+            # La función map_promoter_names_to_codes ya limpia sus propias columnas temporales y maneja advertencias.
 
             # --- Carga de datos de colocaciones (agregado y detallado) ---
-            df_col_agg, df_colocaciones_raw_details = load_data_colocaciones(col_file)
+            df_col_agg, df_col_detail_return = load_data_colocaciones(col_file) # df_col_detail_return is the correct name
 
-            # --- DEBUG EN MAIN: Para ver qué columnas llegan de load_data_colocaciones ---
-            if df_colocaciones_raw_details is not None:
-                st.info(f"DEBUG en main(): Columnas en df_colocaciones_raw_details ANTES del chequeo son: {df_colocaciones_raw_details.columns.tolist()}")
-                st.info(f"DEBUG en main(): df_colocaciones_raw_details está vacío? {df_colocaciones_raw_details.empty}")
+            # Mapeo de nombres para df_col_detail_return (que se convertirá en df_colocaciones_info_completa)
+            if df_col_detail_return is not None and not df_col_detail_return.empty:
+                if "Nombre promotor" in df_col_detail_return.columns:
+                    df_colocaciones_info_completa = map_promoter_names_to_codes(
+                        df_col_detail_return.copy(), # Use .copy()
+                        "Nombre promotor",
+                        df_control
+                    )
+                else:
+                    st.warning("La columna 'Nombre promotor' no se encontró en los datos de colocaciones detallados. No se pudo realizar el mapeo a códigos 'N' para df_colocaciones_info_completa.")
+                    df_colocaciones_info_completa = df_col_detail_return.copy() # Use copy
+                    if "N" not in df_colocaciones_info_completa.columns:
+                        df_colocaciones_info_completa["N"] = pd.NA
             else:
-                # Esto no debería ocurrir si load_data_colocaciones siempre devuelve un DataFrame
-                st.error("DEBUG en main(): df_colocaciones_raw_details es None. Revisar load_data_colocaciones.")
-            # --- FIN DEBUG EN MAIN ---
+                # Si df_col_detail_return está vacío o es None, crear un df_colocaciones_info_completa vacío
+                # con las columnas esperadas incluyendo 'N'
+                expected_cols = df_col_detail_return.columns.tolist() if df_col_detail_return is not None else \
+                                ["Nombre promotor", "Fecha desembolso", "Monto desembolsado", "Nombre del cliente", "Contrato", "Cuota total", "Fecha primer pago"] # Fallback si None
+                if "N" not in expected_cols:
+                    expected_cols.append("N")
+                df_colocaciones_info_completa = pd.DataFrame(columns=expected_cols)
 
-            # Inicializar df_colocaciones_info_completa
-            df_colocaciones_info_completa = pd.DataFrame()
+            df_col_merge = merge_colocaciones(df_col_agg, df_control) # df_col_agg no se mapea, merge_colocaciones handles it.
 
-            # Procesar df_colocaciones_raw_details para crear df_colocaciones_info_completa
-            # El siguiente 'if' debe estar al mismo nivel de indentación que la inicialización de df_colocaciones_info_completa
-            if df_colocaciones_raw_details is not None and not df_colocaciones_raw_details.empty:
-                # El siguiente 'if' debe estar indentado una vez más
-                if "Nombre promotor" in df_colocaciones_raw_details.columns:
-                    # Mapeo directo con Nombre_upper
-                    # Asegúrate de que df_control y df_colocaciones_raw_details están definidos y no son None
-                    if df_control is not None and "Nombre_upper" in df_control.columns and "N" in df_control.columns:
-                        map_nombre_upper_a_N = dict(zip(df_control["Nombre_upper"], df_control["N"]))
-                        df_colocaciones_raw_details["N"] = df_colocaciones_raw_details["Nombre promotor"].map(map_nombre_upper_a_N)
-                    else:
-                        st.error("df_control no está listo para el mapeo de Nombre_upper a N.")
-                        df_colocaciones_raw_details["N"] = pd.NA
-
-
-                    # Fallback Mejorado con Normalización y Fuzzy Map
-                    # Este 'if' está al mismo nivel que el map_nombre_upper_a_N de arriba
-                    if "N" in df_colocaciones_raw_details.columns: # Solo proceder si la columna N fue creada
-                        unmapped_after_upper_map = df_colocaciones_raw_details["N"].isna()
-                        if unmapped_after_upper_map.any():
-                            if df_control is not None and "Nombre" in df_control.columns and "N" in df_control.columns:
-                                control_norm_to_N_map = dict(zip(df_control["Nombre"].apply(normalize_name), df_control["N"]))
-                                choices_fuzzy_colocaciones = list(control_norm_to_N_map.keys())
-
-                                df_colocaciones_raw_details.loc[unmapped_after_upper_map, "Nombre_promotor_norm_temp"] = \
-                                    df_colocaciones_raw_details.loc[unmapped_after_upper_map, "Nombre promotor"].apply(normalize_name)
-
-                                df_colocaciones_raw_details.loc[unmapped_after_upper_map, "N"] = \
-                                    df_colocaciones_raw_details.loc[unmapped_after_upper_map, "Nombre_promotor_norm_temp"].map(control_norm_to_N_map)
-
-                                indices_para_fuzzy = df_colocaciones_raw_details["N"].isna() & unmapped_after_upper_map
-                                if indices_para_fuzzy.any():
-                                    df_colocaciones_raw_details.loc[indices_para_fuzzy, "Nombre_promotor_fuzzy_match_result"] = \
-                                        df_colocaciones_raw_details.loc[indices_para_fuzzy, "Nombre_promotor_norm_temp"].apply(
-                                            lambda nm: fuzzy_map(nm, choices_fuzzy_colocaciones, cutoff=0.8)
-                                        )
-                                    df_colocaciones_raw_details.loc[indices_para_fuzzy, "N"] = \
-                                        df_colocaciones_raw_details.loc[indices_para_fuzzy, "Nombre_promotor_fuzzy_match_result"].map(control_norm_to_N_map)
-
-                                if "Nombre_promotor_norm_temp" in df_colocaciones_raw_details.columns:
-                                    df_colocaciones_raw_details.drop(columns=["Nombre_promotor_norm_temp"], inplace=True)
-                                if "Nombre_promotor_fuzzy_match_result" in df_colocaciones_raw_details.columns:
-                                    df_colocaciones_raw_details.drop(columns=["Nombre_promotor_fuzzy_match_result"], inplace=True)
-                            else:
-                                st.warning("df_control no está listo para el mapeo normalizado/fuzzy de Colocaciones.")
-
-                    # Advertencia y DEBUG final para promotores no mapeados de Colocaciones
-                    if "N" in df_colocaciones_raw_details.columns and df_colocaciones_raw_details["N"].isna().any():
-                        st.warning("Algunos promotores en 'Colocaciones' no pudieron ser mapeados a un código 'N' incluso después del intento de normalización y fuzzy map.")
-                        if "Nombre promotor" in df_colocaciones_raw_details.columns: # Doble chequeo por seguridad
-                            promotores_no_mapeados_col = df_colocaciones_raw_details[df_colocaciones_raw_details["N"].isna()]["Nombre promotor"].unique()
-                            if len(promotores_no_mapeados_col) > 0:
-                                st.error("Los siguientes NOMBRES DE PROMOTOR del archivo 'Colocaciones.xlsx' no se pudieron asignar a un código 'N':")
-                                for nombre_pm_col in promotores_no_mapeados_col:
-                                    st.error(f"- '{nombre_pm_col}'")
-                                st.info("CONSEJO: Revisa que estos nombres en tu archivo 'Colocaciones.xlsx' (columna 'Nombre promotor') coincidan con los nombres en tu archivo 'VasTu.xlsx' (hoja 'Control', columna 'Nombre'). Corrige las diferencias en tus archivos Excel.")
-
-                    df_colocaciones_info_completa = df_colocaciones_raw_details.copy()
-                else: # Este 'else' se alinea con 'if "Nombre promotor" in ...'
-                    st.error("La columna 'Nombre promotor' es necesaria en tu archivo 'Colocaciones.xlsx' (hoja 'Colocación', fila 5) para la pestaña 'Créditos a Detalle'.")
-                    # df_colocaciones_info_completa ya fue inicializada como un DataFrame vacío arriba
-            else: # Este 'else' se alinea con 'if not df_colocaciones_raw_details.empty:'
-                st.info("DEBUG en main(): df_colocaciones_raw_details está vacío o es None. No se procesarán detalles de colocación.")
-                # df_colocaciones_info_completa ya es un DataFrame vacío
-
-            # El resto de tu código en main() continúa aquí...
-            df_col_merge = merge_colocaciones(df_col_agg, df_control)
-
-             # <-- CAMBIO: pasamos df_control a load_data_descuentos
-             df_desc_agg = load_data_descuentos(por_capturar_file, df_control)
-                # Cargamos los Pagos Esperados
-             df_pagos_raw = load_data_pagos(pagos_file)
-
-                # 1) Normalizamos nombres en df_control y en df_pagos_raw
-                df_control["Nombre_norm"]      = df_control["Nombre"].apply(normalize_name)
-                df_pagos_raw["PROMOTOR_norm"]  = df_pagos_raw["PROMOTOR"].apply(normalize_name)
-
-                # 2) Mapeo exacto con el diccionario Nombre_norm -> N
-                name_to_code = dict(zip(df_control["Nombre_norm"], df_control["N"]))
-                df_pagos_raw["N"] = df_pagos_raw["PROMOTOR_norm"].map(name_to_code)
-
-                # 3) Fallback difuso para los no mapeados
-                unmapped = df_pagos_raw["N"].isna()
-                choices = df_control["Nombre_norm"].tolist()
-                df_pagos_raw.loc[unmapped, "PROMOTOR_norm"] = (
-                    df_pagos_raw.loc[unmapped, "PROMOTOR_norm"]
-                    .apply(lambda nm: fuzzy_map(nm, choices))
-                )
-                # Remapeamos tras el fallback
-                df_pagos_raw["N"] = df_pagos_raw["PROMOTOR_norm"].map(name_to_code)
-
-                # 4) Agrupamos finalmente por código
+            # df_control ya tiene Nombre_upper y Nombre_norm gracias a load_data_control
+            df_desc_agg = load_data_descuentos(por_capturar_file, df_control) 
+             
+            df_pagos_raw = load_data_pagos(pagos_file)
+            # Mapeo de nombres para df_pagos_raw
+            if df_pagos_raw is not None and not df_pagos_raw.empty and "PROMOTOR" in df_pagos_raw.columns:
+                df_pagos_raw = map_promoter_names_to_codes(df_pagos_raw.copy(), "PROMOTOR", df_control) # Use .copy()
+            elif df_pagos_raw is not None and "N" not in df_pagos_raw.columns: # If map_promoter_names_to_codes was not run
+                 df_pagos_raw["N"] = pd.NA
+            
+            # Agrupamos df_pagos por el "N" ya mapeado
+            if df_pagos_raw is not None and not df_pagos_raw.empty and "N" in df_pagos_raw.columns:
                 df_pagos = (
                     df_pagos_raw
-                    .dropna(subset=["N"])
+                    .dropna(subset=["N"]) 
                     .groupby("N", as_index=False)["SALDO"]
                     .sum()
                 )
+            else: # df_pagos_raw es None, vacío, o no tiene "N"
+                df_pagos = pd.DataFrame(columns=["N", "SALDO"])
 
-
-                df_promoters_summary = build_promoters_summary(df_control, df_metas_summary, df_cobranza)
+            df_promoters_summary = build_promoters_summary(df_control, df_metas_summary, df_cobranza)
         except Exception as e:
             st.error(f"Error al cargar y procesar los datos: {e}")
             return
@@ -1760,6 +1735,9 @@ def main():
                     df_cob_prom["Deposito"] = pd.to_numeric(df_cob_prom["Deposito"], errors="coerce").fillna(0) # Asumimos que convert_number ya se aplicó en la carga
                 else: # Si Deposito no existe tras renombrar, añadirlo como 0 para evitar errores
                     df_cob_prom["Deposito"] = 0
+                # Asegurar que 'Contrato' sea string para el join
+                if "Contrato" in df_cob_prom.columns:
+                    df_cob_prom["Contrato"] = df_cob_prom["Contrato"].astype(str)
 
 
             # Trabajar con df_col_prom_original para el detalle de colocaciones
@@ -1768,6 +1746,10 @@ def main():
             if df_col_prom.empty:
                 st.info(f"No se encontraron créditos colocados para el promotor {promotor_sel}.")
             else:
+                # Asegurar que 'Contrato' sea string para el join
+                if "Contrato" in df_col_prom.columns:
+                    df_col_prom["Contrato"] = df_col_prom["Contrato"].astype(str)
+                
                 # Nombres de columna esperados directamente desde tu archivo Excel (fila 5)
                 # Estos son los nombres que deben existir en df_col_prom ANTES de renombrar
                 excel_col_names = {
@@ -1818,50 +1800,6 @@ def main():
                 # Convertir tipos de datos (si no se hizo ya al cargar df_colocaciones_info_completa)
                 df_col_prom["FechaPrimerPago"] = pd.to_datetime(df_col_prom["FechaPrimerPago"], errors="coerce")
                 df_col_prom["PS"] = pd.to_numeric(df_col_prom["PS"], errors="coerce").fillna(0)
-
-                # ... (código anterior donde se definen y renombran df_col_prom y df_cob_prom)
-
-                st.markdown("--- DEBUG INFO ---") # Para separar visualmente
-
-                # Información de df_col_prom (Colocaciones)
-                st.subheader("DEBUG: Datos de Colocación (df_col_prom)")
-                if not df_col_prom.empty:
-                    if "Contrato" in df_col_prom.columns:
-                        st.write("Primeros 5 'Contrato' en Colocaciones:", df_col_prom["Contrato"].head().tolist())
-                        st.write("Tipo de dato 'Contrato' en Colocaciones:", df_col_prom["Contrato"].dtype)
-                        st.write(f"Total de créditos para este promotor en Colocaciones: {len(df_col_prom)}")
-                    else:
-                        st.warning("Columna 'Contrato' NO ENCONTRADA en df_col_prom (Colocaciones).")
-                        st.write("Columnas disponibles en df_col_prom:", df_col_prom.columns.tolist())
-                else:
-                    st.write("df_col_prom (Colocaciones) está vacío para este promotor.")
-
-                # Información de df_cob_prom (Cobranza)
-                st.subheader("DEBUG: Datos de Cobranza (df_cob_prom)")
-                if not df_cob_prom.empty:
-                    if "Contrato" in df_cob_prom.columns:
-                        st.write("Primeros 5 'Contrato' en Cobranzas:", df_cob_prom["Contrato"].head().tolist())
-                        st.write("Tipo de dato 'Contrato' en Cobranzas:", df_cob_prom["Contrato"].dtype)
-                        st.write(f"Total de registros de cobranza para este promotor: {len(df_cob_prom)}")
-
-                        # Intentar encontrar un contrato de colocaciones en cobranzas
-                        if not df_col_prom.empty and "Contrato" in df_col_prom.columns and len(df_col_prom["Contrato"]) > 0:
-                            primer_contrato_col = df_col_prom["Contrato"].iloc[0]
-                            st.write(f"Buscando el primer contrato de colocaciones ('{primer_contrato_col}') en Cobranzas:")
-                            pagos_encontrados_debug = df_cob_prom[df_cob_prom["Contrato"] == str(primer_contrato_col)] # Forzar a string por si acaso
-                            if not pagos_encontrados_debug.empty:
-                                st.success(f"¡ENCONTRADO! Se encontraron {len(pagos_encontrados_debug)} pagos para el contrato '{primer_contrato_col}'.")
-                                st.dataframe(pagos_encontrados_debug[["Contrato", "Deposito", "FechaTrans"]].head())
-                            else:
-                                st.error(f"NO ENCONTRADO. Ningún pago para el contrato '{primer_contrato_col}' en Cobranzas.")
-                                st.write(f"Primeros 20 valores únicos de 'Contrato' en Cobranzas para comparar: {df_cob_prom['Contrato'].astype(str).unique()[:20]}")
-                    else:
-                        st.warning("Columna 'Contrato' NO ENCONTRADA en df_cob_prom (Cobranzas).")
-                        st.write("Columnas disponibles en df_cob_prom:", df_cob_prom.columns.tolist())
-                else:
-                    st.write("df_cob_prom (Cobranzas) está vacío para este promotor.")
-
-                st.markdown("--- FIN DEBUG INFO ---")
 
                 # La siguiente línea original es:
                 # hoy = datetime.now().date()
